@@ -1,0 +1,56 @@
+{
+  "created_at": "2026-06-04T19:13:44",
+  "dataset_label": "swebench",
+  "benchmark_dir": "benchmarks/swebench",
+  "bucket_scheme": "three prompt-length buckets used directly by this artifact",
+  "sample_seed": 20260604,
+  "selection": "artifact bucket files live directly in this directory; rows are sorted by instance/task for prefix-cache locality",
+  "total_samples": 300,
+  "buckets": [
+    {
+      "bucket": "0-32K",
+      "range": [
+        0,
+        32768
+      ],
+      "file": "bucket_0_32768.jsonl",
+      "num_samples": 100,
+      "token_stats": {
+        "min": 1308,
+        "max": 32323,
+        "mean": 16437.3,
+        "median": 16348.0
+      }
+    },
+    {
+      "bucket": "32K-64K",
+      "range": [
+        32768,
+        65536
+      ],
+      "file": "bucket_32768_65536.jsonl",
+      "num_samples": 100,
+      "token_stats": {
+        "min": 32849,
+        "max": 65500,
+        "mean": 48676.4,
+        "median": 48504.5
+      }
+    },
+    {
+      "bucket": "64K+",
+      "range": [
+        65536,
+        122880
+      ],
+      "file": "bucket_65536_122880.jsonl",
+      "num_samples": 100,
+      "token_stats": {
+        "min": 65908,
+        "max": 118226,
+        "mean": 91572.1,
+        "median": 91429.5
+      }
+    }
+  ]
+}

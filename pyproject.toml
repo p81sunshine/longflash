@@ -1,0 +1,31 @@
+[project]
+name = "dflash"
+version = "0.1.0"
+description = "DFlash: Block Diffusion for Flash Speculative Decoding"
+requires-python = ">=3.10"
+dependencies = [
+    "rich",
+    "loguru",
+    "numpy",
+    "tqdm",
+    "datasets",
+    "requests",
+    "huggingface-hub",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dflash*"]
+
+[project.optional-dependencies]
+transformers = [
+    "torch",
+    "transformers==4.57.1",
+    "accelerate",
+    "typing-extensions",
+]
+vllm = [
+    "vllm",
+    "datasets>=3,<4",
+    "huggingface-hub<1",
+]
