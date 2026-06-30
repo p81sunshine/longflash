@@ -1,0 +1,15 @@
+rich
+loguru
+numpy
+tqdm
+datasets
+requests
+huggingface-hub
+torch
+transformers==4.57.1
+accelerate
+typing-extensions
+pandas
+openai
+httpx
+pytest

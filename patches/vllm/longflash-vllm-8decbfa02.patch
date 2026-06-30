@@ -1,0 +1,623 @@
+diff --git a/vllm/v1/spec_decode/dflash.py b/vllm/v1/spec_decode/dflash.py
+index 2143b6a..75592e1 100644
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -1,7 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+-from dataclasses import replace
++import os
++from collections import Counter, defaultdict
++from dataclasses import dataclass, field, replace
+ from typing import Any
+ 
+ import torch
+@@ -18,6 +20,298 @@ from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
+ logger = init_logger(__name__)
+ 
+ 
++
++@dataclass(frozen=True)
++class DFlashSuffixNode:
++    token: int | None
++    parent: int
++    depth: int
++    count: int
++    d_score: float
++
++
++@dataclass(frozen=True)
++class DFlashSuffixPrediction:
++    tokens: list[int]
++    support: int
++    query_len: int
++    match_positions: list[int]
++    score: float
++    token_score: float
++    max_spec: int
++    tree_size: int
++    best_path_score: float
++    nodes: list[DFlashSuffixNode]
++
++    def is_high_confidence(self, *, threshold: float) -> bool:
++        return bool(self.tokens) and self.best_path_score > threshold
++
++
++@dataclass
++class DFlashSuffixMatcher:
++    """Per-request paper-style suffix matcher for DFlash draft routing."""
++
++    tokens: list[int] = field(default_factory=list)
++    _positions: dict[int, list[int]] = field(default_factory=lambda: defaultdict(list))
++
++    def __len__(self) -> int:
++        return len(self.tokens)
++
++    def extend(self, new_tokens: list[int]) -> None:
++        base = len(self.tokens)
++        for offset, token_id in enumerate(new_tokens):
++            token_id = int(token_id)
++            self.tokens.append(token_id)
++            self._positions[token_id].append(base + offset)
++
++    def predict(
++        self,
++        *,
++        max_predict_len: int,
++        max_query_len: int,
++        min_query_len: int,
++        alpha: float,
++        max_spec_offset: float,
++        min_token_prob: float,
++        max_match_count: int,
++        match_position_limit: int = 16,
++    ) -> DFlashSuffixPrediction:
++        empty = DFlashSuffixPrediction(
++            tokens=[],
++            support=0,
++            query_len=0,
++            match_positions=[],
++            score=0.0,
++            token_score=0.0,
++            max_spec=0,
++            tree_size=0,
++            best_path_score=0.0,
++            nodes=[],
++        )
++        tokens = self.tokens
++        n = len(tokens)
++        min_query_len = max(1, int(min_query_len))
++        alpha = max(0.0, float(alpha))
++        max_spec_offset = float(max_spec_offset)
++        min_token_prob = max(0.0, float(min_token_prob))
++        if max_predict_len <= 0 or (alpha <= 0 and max_spec_offset <= 0):
++            return empty
++        if n < min_query_len + 1:
++            return empty
++
++        best: DFlashSuffixPrediction | None = None
++        upper_query_len = min(int(max_query_len), n - 1)
++        for query_len in range(min_query_len, upper_query_len + 1):
++            matches = self._find_matches(
++                query_len=query_len,
++                max_match_count=max(0, int(max_match_count)),
++            )
++            if not matches:
++                continue
++            max_spec = min(
++                max_predict_len,
++                max(0, int(alpha * query_len + max_spec_offset + 1e-6)),
++            )
++            if max_spec <= 0:
++                continue
++            candidate = self._expand_tree(
++                matches=matches,
++                query_len=query_len,
++                max_spec=max_spec,
++                min_token_prob=min_token_prob,
++                match_position_limit=max(0, int(match_position_limit)),
++            )
++            if candidate.tree_size <= 0:
++                continue
++            if best is None or (
++                candidate.best_path_score,
++                candidate.query_len,
++                len(candidate.tokens),
++                candidate.score,
++            ) > (
++                best.best_path_score,
++                best.query_len,
++                len(best.tokens),
++                best.score,
++            ):
++                best = candidate
++        return best if best is not None else empty
++
++    def _find_matches(self, *, query_len: int, max_match_count: int) -> list[int]:
++        tokens = self.tokens
++        n = len(tokens)
++        if query_len <= 0 or n < query_len + 1:
++            return []
++        query = tokens[n - query_len : n]
++        if not query:
++            return []
++
++        matches: list[int] = []
++        for pos in reversed(self._positions.get(query[-1], ())):
++            if pos == n - 1 or pos < query_len - 1:
++                continue
++            if tokens[pos - query_len + 1 : pos + 1] != query:
++                continue
++            matches.append(pos)
++            if max_match_count > 0 and len(matches) >= max_match_count:
++                break
++        return matches
++
++    def _expand_tree(
++        self,
++        *,
++        matches: list[int],
++        query_len: int,
++        max_spec: int,
++        min_token_prob: float,
++        match_position_limit: int,
++    ) -> DFlashSuffixPrediction:
++        nodes = [
++            DFlashSuffixNode(
++                token=None,
++                parent=-1,
++                depth=0,
++                count=len(matches),
++                d_score=1.0,
++            )
++        ]
++        paths: list[tuple[int, ...]] = [()]
++        path_to_index: dict[tuple[int, ...], int] = {(): 0}
++        child_count_cache: dict[tuple[int, ...], Counter[int]] = {}
++        prefix_count_cache: dict[tuple[int, ...], int] = {(): len(matches)}
++
++        while len(nodes) - 1 < max_spec:
++            best_parent = -1
++            best_token = -1
++            best_count = 0
++            best_d_score = -1.0
++
++            for parent_idx, prefix in enumerate(paths):
++                child_counts = child_count_cache.get(prefix)
++                if child_counts is None:
++                    child_counts = self._child_counts(matches=matches, prefix=prefix)
++                    child_count_cache[prefix] = child_counts
++                if not child_counts:
++                    continue
++
++                denom = prefix_count_cache.get(prefix)
++                if denom is None:
++                    denom = self._prefix_count(matches=matches, prefix=prefix)
++                    prefix_count_cache[prefix] = denom
++                if denom <= 0:
++                    continue
++                parent_d = nodes[parent_idx].d_score
++                for token_id, count in child_counts.items():
++                    child_path = prefix + (token_id,)
++                    if child_path in path_to_index:
++                        continue
++                    d_score = parent_d * (count / denom)
++                    if d_score < min_token_prob:
++                        continue
++                    if (
++                        d_score > best_d_score
++                        or (d_score == best_d_score and count > best_count)
++                        or (
++                            d_score == best_d_score
++                            and count == best_count
++                            and token_id < best_token
++                        )
++                    ):
++                        best_parent = parent_idx
++                        best_token = token_id
++                        best_count = count
++                        best_d_score = d_score
++
++            if best_parent < 0:
++                break
++
++            best_path = paths[best_parent] + (best_token,)
++            path_to_index[best_path] = len(nodes)
++            prefix_count_cache[best_path] = best_count
++            nodes.append(
++                DFlashSuffixNode(
++                    token=int(best_token),
++                    parent=best_parent,
++                    depth=len(best_path),
++                    count=int(best_count),
++                    d_score=float(best_d_score),
++                )
++            )
++            paths.append(best_path)
++
++        token_score = sum(node.d_score for node in nodes[1:])
++        score = token_score + (nodes[0].d_score if len(nodes) > 1 else 0.0)
++        best_path, best_path_score = self._best_path(nodes, paths)
++        match_positions = matches[:match_position_limit] if match_position_limit else []
++        return DFlashSuffixPrediction(
++            tokens=list(best_path),
++            support=len(matches),
++            query_len=query_len,
++            match_positions=match_positions,
++            score=float(score),
++            token_score=float(token_score),
++            max_spec=max_spec,
++            tree_size=max(0, len(nodes) - 1),
++            best_path_score=float(best_path_score),
++            nodes=nodes,
++        )
++
++    def _prefix_count(self, *, matches: list[int], prefix: tuple[int, ...]) -> int:
++        if not prefix:
++            return len(matches)
++        tokens = self.tokens
++        prefix_len = len(prefix)
++        count = 0
++        for pos in matches:
++            start = pos + 1
++            end = start + prefix_len
++            if end > len(tokens):
++                continue
++            if tuple(tokens[start:end]) == prefix:
++                count += 1
++        return count
++
++    def _child_counts(
++        self,
++        *,
++        matches: list[int],
++        prefix: tuple[int, ...],
++    ) -> Counter[int]:
++        tokens = self.tokens
++        prefix_len = len(prefix)
++        counts: Counter[int] = Counter()
++        for pos in matches:
++            start = pos + 1
++            next_pos = start + prefix_len
++            if next_pos >= len(tokens):
++                continue
++            if prefix_len and tuple(tokens[start:next_pos]) != prefix:
++                continue
++            counts[int(tokens[next_pos])] += 1
++        return counts
++
++    @staticmethod
++    def _best_path(
++        nodes: list[DFlashSuffixNode],
++        paths: list[tuple[int, ...]],
++    ) -> tuple[tuple[int, ...], float]:
++        best_path: tuple[int, ...] = ()
++        best_score = 0.0
++        for idx in range(1, len(nodes)):
++            score = 0.0
++            cursor = idx
++            while cursor > 0:
++                score += nodes[cursor].d_score
++                cursor = nodes[cursor].parent
++            path = paths[idx]
++            if score > best_score or (
++                score == best_score and len(path) > len(best_path)
++            ):
++                best_score = score
++                best_path = path
++        return best_path, best_score
++
++
+ class DFlashProposer(SpecDecodeBaseProposer):
+     def __init__(
+         self,
+@@ -68,6 +362,48 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         # For DFlash we use the input embeddings to embed the mask token
+         self.parallel_drafting_hidden_state_tensor = None
+ 
++        self.dflash_suffix_decoding = os.environ.get("DFLASH_SUFFIX_DECODING", "0") == "1"
++        self.dflash_suffix_max_query_len = int(
++            os.environ.get("DFLASH_SUFFIX_MAX_QUERY_LEN", "16")
++        )
++        self.dflash_suffix_min_query_len = int(
++            os.environ.get("DFLASH_SUFFIX_MIN_QUERY_LEN", "2")
++        )
++        suffix_max_predict_len = os.environ.get("DFLASH_SUFFIX_MAX_PREDICT_LEN")
++        self.dflash_suffix_max_predict_len = (
++            int(suffix_max_predict_len)
++            if suffix_max_predict_len is not None and suffix_max_predict_len != ""
++            else int(self.num_speculative_tokens)
++        )
++        self.dflash_suffix_alpha = float(os.environ.get("DFLASH_SUFFIX_ALPHA", "1"))
++        self.dflash_suffix_max_spec_offset = float(
++            os.environ.get("DFLASH_SUFFIX_MAX_SPEC_OFFSET", "0")
++        )
++        self.dflash_suffix_min_token_prob = float(
++            os.environ.get("DFLASH_SUFFIX_MIN_TOKEN_PROB", "0")
++        )
++        self.dflash_suffix_threshold = float(
++            os.environ.get("DFLASH_SUFFIX_THRESHOLD", "0")
++        )
++        self.dflash_suffix_max_matches = int(
++            os.environ.get("DFLASH_SUFFIX_MAX_MATCHES", "0")
++        )
++        self._dflash_suffix_matchers: dict[str, DFlashSuffixMatcher] = {}
++        if self.dflash_suffix_decoding:
++            logger.info_once(
++                "Using DFlash suffix decoding max_query=%s min_query=%s "
++                "max_predict=%s alpha=%s max_spec_offset=%s min_token_prob=%s "
++                "path_threshold=%s max_matches=%s",
++                self.dflash_suffix_max_query_len,
++                self.dflash_suffix_min_query_len,
++                self.dflash_suffix_max_predict_len,
++                self.dflash_suffix_alpha,
++                self.dflash_suffix_max_spec_offset,
++                self.dflash_suffix_min_token_prob,
++                self.dflash_suffix_threshold,
++                self.dflash_suffix_max_matches,
++            )
++
+     @override
+     def _create_draft_vllm_config(self) -> VllmConfig:
+         base = super()._create_draft_vllm_config()
+@@ -299,3 +635,141 @@ class DFlashProposer(SpecDecodeBaseProposer):
+         if dflash_config is not None:
+             use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
+         return use_aux_hidden_state
++
++    def is_suffix_decoding_enabled(self) -> bool:
++        return bool(self.dflash_suffix_decoding)
++
++    def _new_suffix_matcher_from_input_batch(
++        self,
++        input_batch: Any,
++        req_id: str,
++        sampled_ids: list[int],
++    ) -> DFlashSuffixMatcher:
++        req_index = input_batch.req_id_to_index[req_id]
++        num_tokens = int(input_batch.num_tokens_no_spec[req_index])
++        token_ids = [
++            int(token_id)
++            for token_id in input_batch.token_ids_cpu[req_index, :num_tokens].tolist()
++        ]
++        if sampled_ids and token_ids[-len(sampled_ids) :] == sampled_ids:
++            token_ids = token_ids[: -len(sampled_ids)]
++        matcher = DFlashSuffixMatcher()
++        matcher.extend(token_ids)
++        return matcher
++
++    def _drop_inactive_suffix_matchers(self, active_req_ids: list[str]) -> None:
++        active = set(active_req_ids)
++        for req_id in list(self._dflash_suffix_matchers):
++            if req_id not in active:
++                del self._dflash_suffix_matchers[req_id]
++
++    def propose_suffix_draft(
++        self,
++        input_batch: Any,
++        sampled_token_ids: list[list[int]],
++    ) -> list[list[int]] | None:
++        draft_token_ids = self.propose_suffix_draft_rows(
++            input_batch,
++            sampled_token_ids,
++            pad_hits=True,
++        )
++        if draft_token_ids is None or any(tokens is None for tokens in draft_token_ids):
++            return None
++        return [tokens for tokens in draft_token_ids if tokens is not None]
++
++    def propose_suffix_draft_rows(
++        self,
++        input_batch: Any,
++        sampled_token_ids: list[list[int]],
++        *,
++        pad_hits: bool = False,
++    ) -> list[list[int] | None] | None:
++        if not self.dflash_suffix_decoding:
++            return None
++
++        req_ids = input_batch.req_ids
++        self._drop_inactive_suffix_matchers(req_ids)
++        if len(req_ids) == 0 or len(req_ids) != len(sampled_token_ids):
++            return None
++
++        draft_token_ids: list[list[int] | None] = []
++        for req_id, sampled_ids in zip(req_ids, sampled_token_ids):
++            tokens = self._propose_suffix_draft_for_request(
++                input_batch,
++                req_id,
++                [int(token_id) for token_id in sampled_ids],
++            )
++            if tokens is not None and pad_hits:
++                tokens = self._pad_suffix_draft_to_num_spec(tokens)
++            draft_token_ids.append(tokens)
++
++        return draft_token_ids
++
++    def _propose_suffix_draft_for_request(
++        self,
++        input_batch: Any,
++        req_id: str,
++        sampled_ids: list[int],
++    ) -> list[int] | None:
++        req_index = input_batch.req_id_to_index[req_id]
++        if not sampled_ids:
++            return None
++        if int(input_batch.num_computed_tokens_cpu[req_index]) < int(
++            input_batch.num_prompt_tokens[req_index]
++        ):
++            return None
++
++        matcher = self._dflash_suffix_matchers.get(req_id)
++        if matcher is None:
++            matcher = self._new_suffix_matcher_from_input_batch(
++                input_batch,
++                req_id,
++                sampled_ids,
++            )
++            self._dflash_suffix_matchers[req_id] = matcher
++        matcher.extend(sampled_ids)
++
++        remaining = int(self.max_model_len) - len(matcher) - 1
++        max_predict_len = min(
++            int(self.num_speculative_tokens),
++            int(self.dflash_suffix_max_predict_len),
++            remaining,
++        )
++        if max_predict_len <= 0:
++            return None
++
++        prediction = matcher.predict(
++            max_predict_len=max_predict_len,
++            max_query_len=self.dflash_suffix_max_query_len,
++            min_query_len=self.dflash_suffix_min_query_len,
++            alpha=self.dflash_suffix_alpha,
++            max_spec_offset=self.dflash_suffix_max_spec_offset,
++            min_token_prob=self.dflash_suffix_min_token_prob,
++            max_match_count=self.dflash_suffix_max_matches,
++        )
++        self._dflash_last_suffix_prediction = prediction
++        if not prediction.is_high_confidence(threshold=self.dflash_suffix_threshold):
++            return None
++
++        tokens = prediction.tokens[:max_predict_len]
++        if not tokens:
++            return None
++        if os.environ.get("DFLASH_DEBUG_SUFFIX"):
++            logger.warning(
++                "DFlash suffix hit req=%s len=%s path_score=%.4f tree_score=%.4f query=%s support=%s",
++                req_id,
++                len(tokens),
++                prediction.best_path_score,
++                prediction.score,
++                prediction.query_len,
++                prediction.support,
++            )
++        return [int(token_id) for token_id in tokens]
++
++    def _pad_suffix_draft_to_num_spec(self, tokens: list[int]) -> list[int]:
++        max_len = int(self.num_speculative_tokens)
++        if len(tokens) >= max_len:
++            return tokens[:max_len]
++        if not tokens:
++            return tokens
++        return tokens + [tokens[-1]] * (max_len - len(tokens))
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index bcab2ca..64fe3b1 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4239,7 +4239,7 @@ class GPUModelRunner(
+         self.valid_sampled_token_count_gpu = None
+         self.input_batch.prev_sampled_token_ids = None
+ 
+-        def propose_draft_token_ids(sampled_token_ids):
++        def propose_draft_token_ids(sampled_token_ids, *, copy_to_cpu: bool = True):
+             assert spec_decode_common_attn_metadata is not None
+             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                 self._draft_token_ids = self.propose_draft_token_ids(
+@@ -4253,21 +4253,44 @@ class GPUModelRunner(
+                     spec_decode_common_attn_metadata,
+                     slot_mappings,
+                 )
+-                self._copy_draft_token_ids_to_cpu(scheduler_output)
++                if copy_to_cpu:
++                    self._copy_draft_token_ids_to_cpu(scheduler_output)
+ 
+         spec_config = self.speculative_config
+         propose_drafts_after_bookkeeping = False
++        dflash_suffix_after_bookkeeping = False
+         if spec_config is not None:
+             # Decide whether to run the drafter or zero out draft tokens.
+             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
+                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+                 <= self.effective_drafter_max_model_len
+             )
++            dflash_suffix_after_bookkeeping = (
++                input_fits_in_drafter
++                and spec_config.use_dflash()
++                and isinstance(self.drafter, DFlashProposer)
++                and self.drafter.is_suffix_decoding_enabled()
++                and not self.use_async_scheduling
++            )
++            if (
++                input_fits_in_drafter
++                and spec_config.use_dflash()
++                and isinstance(self.drafter, DFlashProposer)
++                and self.drafter.is_suffix_decoding_enabled()
++                and self.use_async_scheduling
++            ):
++                logger.warning_once(
++                    "DFlash suffix decoding is disabled while async scheduling "
++                    "is enabled; short suffix drafts require CPU-side "
++                    "bookkeeping before the next draft proposal. Use "
++                    "--no-async-scheduling to enable suffix decoding."
++                )
+             use_gpu_toks = (
+                 spec_config.use_eagle()
+                 or spec_config.uses_draft_model()
+                 or spec_config.uses_extract_hidden_states()
+             ) and not spec_config.disable_padded_drafter_batch
++            use_gpu_toks = use_gpu_toks and not dflash_suffix_after_bookkeeping
+             if use_gpu_toks:
+                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+                 # as inputs, and does not need to wait for bookkeeping to finish.
+@@ -4316,6 +4339,8 @@ class GPUModelRunner(
+                     self._copy_valid_sampled_token_count(
+                         next_token_ids, valid_sampled_tokens_count
+                     )
++            elif dflash_suffix_after_bookkeeping:
++                pass
+             else:
+                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+ 
+@@ -4347,7 +4372,48 @@ class GPUModelRunner(
+                 scheduler_output.total_num_scheduled_tokens,
+             )
+ 
+-        if propose_drafts_after_bookkeeping:
++        if dflash_suffix_after_bookkeeping:
++            assert isinstance(self.drafter, DFlashProposer)
++            suffix_draft_token_rows = self.drafter.propose_suffix_draft_rows(
++                self.input_batch,
++                valid_sampled_token_ids,
++                pad_hits=True,
++            )
++            if suffix_draft_token_rows is not None and all(
++                tokens is not None for tokens in suffix_draft_token_rows
++            ):
++                self._draft_token_ids = [
++                    tokens
++                    for tokens in suffix_draft_token_rows
++                    if tokens is not None
++                ]
++                self._draft_token_req_ids = self.input_batch.req_ids.copy()
++            elif suffix_draft_token_rows is not None and any(
++                tokens is not None for tokens in suffix_draft_token_rows
++            ):
++                propose_draft_token_ids(
++                    sampler_output.sampled_token_ids,
++                    copy_to_cpu=False,
++                )
++                if torch.is_tensor(self._draft_token_ids):
++                    for req_idx, tokens in enumerate(suffix_draft_token_rows):
++                        if tokens is None:
++                            continue
++                        self._draft_token_ids[req_idx, : len(tokens)] = torch.tensor(
++                            tokens,
++                            dtype=self._draft_token_ids.dtype,
++                            device=self._draft_token_ids.device,
++                        )
++                    self._copy_draft_token_ids_to_cpu(scheduler_output)
++                else:
++                    assert isinstance(self._draft_token_ids, list)
++                    for req_idx, tokens in enumerate(suffix_draft_token_rows):
++                        if tokens is not None:
++                            self._draft_token_ids[req_idx] = tokens
++                    self._draft_token_req_ids = self.input_batch.req_ids.copy()
++            else:
++                propose_draft_token_ids(sampler_output.sampled_token_ids)
++        elif propose_drafts_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+             # tokens on the CPU, so they are run after bookkeeping.
+             propose_draft_token_ids(valid_sampled_token_ids)

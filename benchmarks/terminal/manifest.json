@@ -1,0 +1,56 @@
+{
+  "created_at": "2026-06-04T19:13:43",
+  "dataset_label": "terminal",
+  "benchmark_dir": "benchmarks/terminal",
+  "bucket_scheme": "three prompt-length buckets used directly by this artifact",
+  "sample_seed": 20260604,
+  "selection": "artifact bucket files live directly in this directory; rows are sorted by instance/task for prefix-cache locality",
+  "total_samples": 239,
+  "buckets": [
+    {
+      "bucket": "0-32K",
+      "range": [
+        0,
+        32768
+      ],
+      "file": "bucket_0_32768.jsonl",
+      "num_samples": 100,
+      "token_stats": {
+        "min": 758,
+        "max": 32732,
+        "mean": 16234.6,
+        "median": 16953.0
+      }
+    },
+    {
+      "bucket": "32K-64K",
+      "range": [
+        32768,
+        65536
+      ],
+      "file": "bucket_32768_65536.jsonl",
+      "num_samples": 100,
+      "token_stats": {
+        "min": 33310,
+        "max": 65393,
+        "mean": 49228.0,
+        "median": 49071.0
+      }
+    },
+    {
+      "bucket": "64K+",
+      "range": [
+        65536,
+        98304
+      ],
+      "file": "bucket_65536_98304.jsonl",
+      "num_samples": 39,
+      "token_stats": {
+        "min": 66108,
+        "max": 97039,
+        "mean": 74447.3,
+        "median": 72574
+      }
+    }
+  ]
+}
